@@ -33,27 +33,24 @@ RUN groupadd -g 999 appuser && \
     mkdir -p /home/appuser/.keras/models && \
     chown -R appuser:appuser /home/appuser
 
-ADD https://github.com/fchollet/deep-learning-models/releases/download/v0.2/resnet50_weights_tf_dim_ordering_tf_kernels_notop.h5 /home/appuser/.keras/models/resnet50_weights_tf_dim_ordering_tf_kernels_notop.h5
+COPY submission/assets/resnet50_weights_tf_dim_ordering_tf_kernels_notop.h5 /home/appuser/.keras/models/resnet50_weights_tf_dim_ordering_tf_kernels_notop.h5
 
+RUN mkdir -p /home/appuser/output
 RUN chmod -R 777 /home/appuser/
-
-USER appuser
 
 SHELL ["/bin/bash", "-c"]
 
-RUN mkdir -p /home/appuser/code/xview-2
-RUN mkdir -p /home/appuser/submission
-RUN mkdir -p /home/appuser/output
+RUN pip3 install --upgrade "pip<21" setuptools wheel
+RUN pip3 install numpy
+RUN pip3 install "tensorflow==1.15.5"
+RUN pip3 install "keras==2.2.4" "h5py<3"
+RUN pip3 install matplotlib tqdm scipy Pillow scikit-image imgaug IPython geopandas imantics scikit-learn chainer tensorboard tensorboardX
+RUN pip3 install opencv-python-headless==4.3.0.38
 
-RUN pip install --upgrade "pip<21" setuptools wheel
-RUN pip install numpy
-RUN pip install "tensorflow==1.15.5"
-RUN pip install matplotlib tqdm scipy Pillow scikit-image opencv-python-headless==4.5.5.64 imgaug IPython geopandas keras imantics scikit-learn chainer tensorboard tensorboardX
-
-RUN git clone https://github.com/DIUx-xView/xview2-baseline.git /home/appuser/code/xview-2
-
-RUN curl -L https://github.com/DIUx-xView/xView2/releases/download/v1.0/localization.h5 -o /home/appuser/code/xview-2/weights/localization.h5
-RUN curl -L https://github.com/DIUx-xView/xView2/releases/download/v1.0/classification.hdf5 -o /home/appuser/code/xview-2/weights/classification.hdf5
-
+COPY . /home/appuser/code/xview-2
 RUN chmod +x /home/appuser/code/xview-2/submission/run.sh
+RUN chown -R appuser:appuser /home/appuser/code/xview-2
+
+USER appuser
+
 ENTRYPOINT ["/home/appuser/code/xview-2/submission/run.sh", "/home/appuser/code/xview-2/"]
