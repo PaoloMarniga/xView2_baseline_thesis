@@ -1,3 +1,7 @@
+##############
+# OOD_beta_tcvae_classifier_fixed.py
+##############
+
 from pathlib import Path
 import random
 import json
@@ -7,7 +11,7 @@ import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
 
-from sklearn.metrics import f1_score, classification_report
+from sklearn.metrics import f1_score, classification_report, confusion_matrix
 from sklearn.utils.class_weight import compute_class_weight
 
 import torch
@@ -16,14 +20,17 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 
+##############
+# 1. Configuration
+##############
+
 BASE_DIR = Path.home() / "Desktop"
 
 CSV_PATH = BASE_DIR / "OOD_processed" / "buildings_all_OOD_with_crops.csv"
-ENCODER_PATH = BASE_DIR / "OOD_training_outputs" / "beta_tcvae" / "beta_tcvae_encoder.pt"
+ENCODER_PATH = BASE_DIR / "OOD_training_outputs" / "beta_tcvae_fixed" / "beta_tcvae_encoder.pt"
 
-OUTPUT_DIR = BASE_DIR / "OOD_training_outputs" / "beta_tcvae_classifier_finetuned"
+OUTPUT_DIR = BASE_DIR / "OOD_training_outputs" / "beta_tcvae_classifier_fixed"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
 
 SEED = 42
 BATCH_SIZE = 32
@@ -32,17 +39,21 @@ NUM_WORKERS = 2
 
 CLASSIFIER_LR = 1e-4
 ENCODER_LR = 1e-5
+WEIGHT_DECAY = 1e-4
 
 USE_CLASS_WEIGHTS = True
-USE_FOCAL_LOSS = True
+USE_FOCAL_LOSS = False
 FOCAL_GAMMA = 2.0
+USE_SQRT_CLASS_WEIGHTS = False
+
+FREEZE_ENCODER = False
+USE_MU_ONLY = True
 
 LATENT_DIM = 128
 
 TRAIN_SPLIT = "OOD_train"
 TEST_SPLIT = "OOD_test"
 HOLD_SPLIT = "OOD_hold"
-
 
 LABEL_TO_IDX = {
     "no-damage": 0,
@@ -53,6 +64,10 @@ LABEL_TO_IDX = {
 
 IDX_TO_LABEL = {v: k for k, v in LABEL_TO_IDX.items()}
 
+
+##############
+# 2. Reproducibility and device
+##############
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -67,11 +82,14 @@ set_seed(SEED)
 def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
-    elif torch.backends.mps.is_available():
+    if torch.backends.mps.is_available():
         return torch.device("mps")
-    else:
-        return torch.device("cpu")
+    return torch.device("cpu")
 
+
+##############
+# 3. Dataset
+##############
 
 class XViewBuildingDataset(Dataset):
     def __init__(self, dataframe, train=False):
@@ -104,9 +122,15 @@ class XViewBuildingDataset(Dataset):
         return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.long)
 
 
+##############
+# 4. Encoder and classifier
+##############
+
 class BetaTCVAEEncoder(nn.Module):
-    def __init__(self, latent_dim=128):
+    def __init__(self, latent_dim=128, use_mu_only=True):
         super().__init__()
+
+        self.use_mu_only = use_mu_only
 
         self.encoder = nn.Sequential(
             nn.Conv2d(6, 32, kernel_size=4, stride=2, padding=1),
@@ -134,9 +158,10 @@ class BetaTCVAEEncoder(nn.Module):
         mu = self.fc_mu(h)
         logvar = self.fc_logvar(h)
 
-        z = torch.cat([mu, logvar], dim=1)
+        if self.use_mu_only:
+            return mu
 
-        return z
+        return torch.cat([mu, logvar], dim=1)
 
 
 class LatentClassifier(nn.Module):
@@ -173,6 +198,10 @@ class BetaTCVAEClassifier(nn.Module):
         return logits
 
 
+##############
+# 5. Loss
+##############
+
 class FocalLoss(nn.Module):
     def __init__(self, weight=None, gamma=2.0):
         super().__init__()
@@ -180,18 +209,26 @@ class FocalLoss(nn.Module):
         self.gamma = gamma
 
     def forward(self, logits, targets):
-        ce = F.cross_entropy(
+        ce_unweighted = F.cross_entropy(
             logits,
             targets,
-            weight=self.weight,
             reduction="none",
         )
 
-        pt = torch.exp(-ce)
-        loss = ((1.0 - pt) ** self.gamma) * ce
+        pt = torch.exp(-ce_unweighted)
+        focal_factor = (1.0 - pt) ** self.gamma
+
+        loss = focal_factor * ce_unweighted
+
+        if self.weight is not None:
+            loss = self.weight[targets] * loss
 
         return loss.mean()
 
+
+##############
+# 6. Evaluation
+##############
 
 def evaluate(model, loader, criterion, device, desc="Evaluating"):
     model.eval()
@@ -218,13 +255,25 @@ def evaluate(model, loader, criterion, device, desc="Evaluating"):
             targets_all.extend(y.cpu().numpy())
 
     avg_loss = total_loss / len(loader.dataset)
-    macro_f1 = f1_score(targets_all, preds_all, average="macro")
+
+    macro_f1 = f1_score(
+        targets_all,
+        preds_all,
+        average="macro",
+        labels=[0, 1, 2, 3],
+        zero_division=0,
+    )
+
     per_class_f1 = f1_score(
         targets_all,
         preds_all,
         average=None,
         labels=[0, 1, 2, 3],
+        zero_division=0,
     )
+
+    pred_counts = pd.Series(preds_all).value_counts().sort_index().to_dict()
+    target_counts = pd.Series(targets_all).value_counts().sort_index().to_dict()
 
     return {
         "loss": avg_loss,
@@ -232,8 +281,28 @@ def evaluate(model, loader, criterion, device, desc="Evaluating"):
         "per_class_f1": per_class_f1,
         "preds": preds_all,
         "targets": targets_all,
+        "pred_counts": pred_counts,
+        "target_counts": target_counts,
     }
 
+
+def print_prediction_distribution(metrics, title):
+    print(f"\n{title} prediction distribution:")
+    for idx in range(4):
+        label = IDX_TO_LABEL[idx]
+        count = metrics["pred_counts"].get(idx, 0)
+        print(f"{label}: {count}")
+
+    print(f"\n{title} true distribution:")
+    for idx in range(4):
+        label = IDX_TO_LABEL[idx]
+        count = metrics["target_counts"].get(idx, 0)
+        print(f"{label}: {count}")
+
+
+##############
+# 7. Main
+##############
 
 def main():
     print("Loading data...")
@@ -265,6 +334,12 @@ def main():
     print("\nTrain label distribution:")
     print(train_df["damage_label"].value_counts())
 
+    print("\nTest label distribution:")
+    print(test_df["damage_label"].value_counts())
+
+    print("\nHold label distribution:")
+    print(hold_df["damage_label"].value_counts())
+
     loader_kwargs = {
         "batch_size": BATCH_SIZE,
         "num_workers": NUM_WORKERS,
@@ -295,20 +370,29 @@ def main():
     device = get_device()
     print(f"\nUsing device: {device}")
 
-    print("\nLoading pretrained β TCVAE encoder...")
+    print("\nLoading pretrained beta TCVAE encoder...")
     encoder_checkpoint = torch.load(ENCODER_PATH, map_location=device)
 
     latent_dim = encoder_checkpoint.get("latent_dim", LATENT_DIM)
 
-    encoder = BetaTCVAEEncoder(latent_dim=latent_dim)
+    encoder = BetaTCVAEEncoder(
+        latent_dim=latent_dim,
+        use_mu_only=USE_MU_ONLY,
+    )
 
     encoder.encoder.load_state_dict(encoder_checkpoint["encoder"])
     encoder.fc_mu.load_state_dict(encoder_checkpoint["fc_mu"])
     encoder.fc_logvar.load_state_dict(encoder_checkpoint["fc_logvar"])
-
     encoder = encoder.to(device)
 
-    classifier_input_dim = latent_dim * 2
+    if FREEZE_ENCODER:
+        print("\nFreezing encoder parameters.")
+        for param in encoder.parameters():
+            param.requires_grad = False
+    else:
+        print("\nFine tuning encoder parameters.")
+
+    classifier_input_dim = latent_dim if USE_MU_ONLY else latent_dim * 2
 
     classifier = LatentClassifier(
         input_dim=classifier_input_dim,
@@ -324,6 +408,9 @@ def main():
             y=train_df["damage_label"].map(LABEL_TO_IDX).values,
         )
 
+        if USE_SQRT_CLASS_WEIGHTS:
+            class_weights = np.sqrt(class_weights)
+
         class_weights = torch.tensor(
             class_weights,
             dtype=torch.float32,
@@ -332,26 +419,46 @@ def main():
         print("\nUsing class weights:", class_weights.cpu().numpy())
     else:
         class_weights = None
+        print("\nNot using class weights.")
 
     if USE_FOCAL_LOSS:
         criterion = FocalLoss(weight=class_weights, gamma=FOCAL_GAMMA)
-        print("\nUsing focal loss")
+        print("\nUsing corrected focal loss")
     else:
         criterion = nn.CrossEntropyLoss(weight=class_weights)
         print("\nUsing cross entropy loss")
 
-    optimizer = torch.optim.Adam(
-        [
-            {"params": model.encoder.parameters(), "lr": ENCODER_LR},
-            {"params": model.classifier.parameters(), "lr": CLASSIFIER_LR},
-        ]
+    trainable_encoder_params = [
+        p for p in model.encoder.parameters() if p.requires_grad
+    ]
+
+    optimizer_param_groups = []
+
+    if len(trainable_encoder_params) > 0:
+        optimizer_param_groups.append(
+            {
+                "params": trainable_encoder_params,
+                "lr": ENCODER_LR,
+            }
+        )
+
+    optimizer_param_groups.append(
+        {
+            "params": model.classifier.parameters(),
+            "lr": CLASSIFIER_LR,
+        }
+    )
+
+    optimizer = torch.optim.AdamW(
+        optimizer_param_groups,
+        weight_decay=WEIGHT_DECAY,
     )
 
     best_state = None
     best_test_f1 = -1.0
     history = []
 
-    print("\nStarting fine tuned β TCVAE classifier training...")
+    print("\nStarting fixed beta TCVAE classifier training...")
 
     for epoch in range(1, NUM_EPOCHS + 1):
         model.train()
@@ -369,7 +476,11 @@ def main():
             logits = model(x)
             loss = criterion(logits, y)
 
+            if torch.isnan(loss):
+                raise RuntimeError("NaN loss detected during classifier training.")
+
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
 
             total_loss += loss.item() * x.size(0)
@@ -422,7 +533,7 @@ def main():
     history_df = pd.DataFrame(history)
     history_df.to_csv(OUTPUT_DIR / "training_history.csv", index=False)
 
-    print("\nEvaluating best fine tuned β TCVAE classifier...")
+    print("\nEvaluating best fixed beta TCVAE classifier...")
     model.load_state_dict(best_state)
 
     final_test = evaluate(
@@ -448,8 +559,11 @@ def main():
             final_test["preds"],
             target_names=[IDX_TO_LABEL[i] for i in range(4)],
             digits=4,
+            zero_division=0,
         )
     )
+
+    print_prediction_distribution(final_test, "TEST")
 
     print(f"\nFinal HOLD Macro F1: {final_hold['macro_f1']:.4f}")
     print(
@@ -458,8 +572,11 @@ def main():
             final_hold["preds"],
             target_names=[IDX_TO_LABEL[i] for i in range(4)],
             digits=4,
+            zero_division=0,
         )
     )
+
+    print_prediction_distribution(final_hold, "HOLD")
 
     test_report = classification_report(
         final_test["targets"],
@@ -467,6 +584,7 @@ def main():
         target_names=[IDX_TO_LABEL[i] for i in range(4)],
         digits=4,
         output_dict=True,
+        zero_division=0,
     )
 
     hold_report = classification_report(
@@ -475,12 +593,27 @@ def main():
         target_names=[IDX_TO_LABEL[i] for i in range(4)],
         digits=4,
         output_dict=True,
+        zero_division=0,
+    )
+
+    test_cm = confusion_matrix(
+        final_test["targets"],
+        final_test["preds"],
+        labels=[0, 1, 2, 3],
+    )
+
+    hold_cm = confusion_matrix(
+        final_hold["targets"],
+        final_hold["preds"],
+        labels=[0, 1, 2, 3],
     )
 
     np.save(OUTPUT_DIR / "beta_tcvae_test_preds.npy", np.array(final_test["preds"]))
     np.save(OUTPUT_DIR / "beta_tcvae_test_targets.npy", np.array(final_test["targets"]))
     np.save(OUTPUT_DIR / "beta_tcvae_hold_preds.npy", np.array(final_hold["preds"]))
     np.save(OUTPUT_DIR / "beta_tcvae_hold_targets.npy", np.array(final_hold["targets"]))
+    np.save(OUTPUT_DIR / "beta_tcvae_test_confusion_matrix.npy", test_cm)
+    np.save(OUTPUT_DIR / "beta_tcvae_hold_confusion_matrix.npy", hold_cm)
 
     summary = {
         "seed": SEED,
@@ -488,10 +621,14 @@ def main():
         "epochs": NUM_EPOCHS,
         "classifier_learning_rate": CLASSIFIER_LR,
         "encoder_learning_rate": ENCODER_LR,
+        "weight_decay": WEIGHT_DECAY,
         "num_workers": NUM_WORKERS,
         "use_class_weights": USE_CLASS_WEIGHTS,
+        "use_sqrt_class_weights": USE_SQRT_CLASS_WEIGHTS,
         "use_focal_loss": USE_FOCAL_LOSS,
         "focal_gamma": FOCAL_GAMMA,
+        "freeze_encoder": FREEZE_ENCODER,
+        "use_mu_only": USE_MU_ONLY,
         "latent_dim": latent_dim,
         "classifier_input_dim": classifier_input_dim,
         "encoder_path": str(ENCODER_PATH),
@@ -502,6 +639,12 @@ def main():
         "train_size": int(len(train_df)),
         "test_size": int(len(test_df)),
         "hold_size": int(len(hold_df)),
+        "test_prediction_distribution": {
+            IDX_TO_LABEL[int(k)]: int(v) for k, v in final_test["pred_counts"].items()
+        },
+        "hold_prediction_distribution": {
+            IDX_TO_LABEL[int(k)]: int(v) for k, v in final_hold["pred_counts"].items()
+        },
     }
 
     with open(OUTPUT_DIR / "summary.json", "w", encoding="utf-8") as f:
@@ -513,7 +656,7 @@ def main():
     with open(OUTPUT_DIR / "hold_classification_report.json", "w", encoding="utf-8") as f:
         json.dump(hold_report, f, indent=2)
 
-    print("\nSaved fine tuned β TCVAE classifier outputs:")
+    print("\nSaved fixed beta TCVAE classifier outputs:")
     print(OUTPUT_DIR / "best_model.pt")
     print(OUTPUT_DIR / "training_history.csv")
     print(OUTPUT_DIR / "summary.json")

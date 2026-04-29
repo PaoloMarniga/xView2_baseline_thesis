@@ -1,13 +1,6 @@
 ##############
-# 1. Imports
+# beta_tcvae_pretrain_fixed.py
 ##############
-# We import the libraries needed for:
-# - file paths
-# - reproducibility
-# - data handling
-# - model training
-# - progress bars
-# - PyTorch neural network components
 
 from pathlib import Path
 import random
@@ -24,19 +17,17 @@ from torch.utils.data import Dataset, DataLoader
 
 
 ##############
-# 2. Configuration
+# 1. Configuration
 ##############
-# This section defines all important settings in one place.
-# This makes the experiment easier to reproduce and modify.
 
 BASE_DIR = Path.home() / "Desktop"
 CSV_PATH = BASE_DIR / "OOD_processed" / "buildings_all_OOD_with_crops.csv"
-OUTPUT_DIR = BASE_DIR / "OOD_training_outputs" / "beta_tcvae"
+OUTPUT_DIR = BASE_DIR / "OOD_training_outputs" / "beta_tcvae_fixed"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 SEED = 42
 BATCH_SIZE = 32
-NUM_EPOCHS = 10
+NUM_EPOCHS = 15
 LEARNING_RATE = 1e-4
 NUM_WORKERS = 2
 
@@ -46,15 +37,12 @@ BETA_TC = 1.0
 IMAGE_CHANNELS = 6
 IMAGE_SIZE = 128
 
+TRAIN_SPLIT = "OOD_train"
+
 
 ##############
-# 3. Reproducibility
+# 2. Reproducibility
 ##############
-# This fixes random seeds so that the experiment is as reproducible as possible.
-# It affects:
-# - Python random numbers
-# - NumPy random numbers
-# - PyTorch random numbers
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -67,34 +55,20 @@ set_seed(SEED)
 
 
 ##############
-# 4. Device selection
+# 3. Device
 ##############
-# This selects the fastest available device.
-# On your MacBook, this should choose "mps", which uses Apple Silicon acceleration.
 
 def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
-    elif torch.backends.mps.is_available():
+    if torch.backends.mps.is_available():
         return torch.device("mps")
-    else:
-        return torch.device("cpu")
+    return torch.device("cpu")
 
 
 ##############
-# 5. Dataset class
+# 4. Dataset
 ##############
-# This dataset reads the saved crop files from disk.
-# Each crop is stored as a .npy file with shape:
-# (128, 128, 6)
-#
-# The 6 channels are:
-# - first 3 channels: pre-disaster RGB image
-# - last 3 channels: post-disaster RGB image
-#
-# The data is converted to:
-# (6, 128, 128)
-# because PyTorch expects channel-first format.
 
 class XViewCropDataset(Dataset):
     def __init__(self, dataframe):
@@ -114,38 +88,12 @@ class XViewCropDataset(Dataset):
 
 
 ##############
-# 6. β-TCVAE model
+# 5. Model
 ##############
-# The model has two main parts:
-#
-# 1. Encoder:
-#    compresses the input image into a smaller latent representation.
-#
-# 2. Decoder:
-#    reconstructs the original image from the latent representation.
-#
-# The latent representation is described by:
-# - mu: mean of the latent distribution
-# - logvar: log variance of the latent distribution
-#
-# A latent vector z is sampled using the reparameterization trick.
 
 class BetaTCVAE(nn.Module):
-    def __init__(self, latent_dim=64):
+    def __init__(self, latent_dim=128):
         super().__init__()
-
-        ##############
-        # Encoder
-        ##############
-        # Input:
-        # 6 x 128 x 128
-        #
-        # Output after convolutions:
-        # 256 x 8 x 8
-        #
-        # This is then flattened and mapped to:
-        # - mu
-        # - logvar
 
         self.encoder = nn.Sequential(
             nn.Conv2d(6, 32, kernel_size=4, stride=2, padding=1),
@@ -168,17 +116,6 @@ class BetaTCVAE(nn.Module):
         self.fc_mu = nn.Linear(self.flatten_dim, latent_dim)
         self.fc_logvar = nn.Linear(self.flatten_dim, latent_dim)
 
-        ##############
-        # Decoder
-        ##############
-        # The decoder takes the latent vector z and reconstructs the image.
-        #
-        # Input:
-        # latent vector z
-        #
-        # Output:
-        # reconstructed 6 x 128 x 128 image
-
         self.decoder_input = nn.Linear(latent_dim, self.flatten_dim)
 
         self.decoder = nn.Sequential(
@@ -197,45 +134,21 @@ class BetaTCVAE(nn.Module):
             nn.Sigmoid(),
         )
 
-    ##############
-    # Encode
-    ##############
-    # Converts an image into mu and logvar.
-
     def encode(self, x):
         h = self.encoder(x)
         mu = self.fc_mu(h)
         logvar = self.fc_logvar(h)
         return mu, logvar
 
-    ##############
-    # Reparameterization trick
-    ##############
-    # Instead of sampling z directly in a way that blocks gradients,
-    # we sample random noise and scale it using mu and logvar.
-    #
-    # This allows the model to learn through backpropagation.
-
     def reparameterize(self, mu, logvar):
+        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    ##############
-    # Decode
-    ##############
-    # Converts latent vector z back into a reconstructed image.
-
     def decode(self, z):
         h = self.decoder_input(z)
-        recon = self.decoder(h)
-        return recon
-
-    ##############
-    # Forward pass
-    ##############
-    # Full β-TCVAE process:
-    # image -> encoder -> mu/logvar -> sample z -> decoder -> reconstruction
+        return self.decoder(h)
 
     def forward(self, x):
         mu, logvar = self.encode(x)
@@ -245,29 +158,15 @@ class BetaTCVAE(nn.Module):
 
 
 ##############
-# 7. Gaussian log density
+# 6. Loss helpers
 ##############
-# This helper function computes how likely a latent vector is under
-# a Gaussian distribution.
-#
-# It is used to estimate Total Correlation.
 
 def gaussian_log_density(z, mu, logvar):
-    normalization = -0.5 * (np.log(2 * np.pi) + logvar)
+    logvar = torch.clamp(logvar, min=-10.0, max=10.0)
+    normalization = -0.5 * (np.log(2.0 * np.pi) + logvar)
     inv_var = torch.exp(-logvar)
-    log_density = normalization - 0.5 * ((z - mu) ** 2 * inv_var)
-    return log_density
+    return normalization - 0.5 * ((z - mu) ** 2 * inv_var)
 
-
-##############
-# 8. Total Correlation estimate
-##############
-# Total Correlation checks whether latent variables are independent.
-#
-# If dimensions of z are highly dependent on each other,
-# the TC value becomes larger.
-#
-# β-TCVAE penalizes this, encouraging the model to learn more separated factors.
 
 def estimate_total_correlation(z, mu, logvar):
     batch_size, latent_dim = z.shape
@@ -283,31 +182,16 @@ def estimate_total_correlation(z, mu, logvar):
     log_q_z_product = torch.logsumexp(log_q_z_prob, dim=1) - np.log(batch_size)
     log_q_z_product = log_q_z_product.sum(dim=1)
 
-    tc = (log_q_z - log_q_z_product).mean()
-    return tc
+    return (log_q_z - log_q_z_product).mean()
 
-
-##############
-# 9. β-TCVAE loss
-##############
-# The total loss has three parts:
-#
-# 1. Reconstruction loss:
-#    makes the reconstructed image similar to the input image.
-#
-# 2. KL loss:
-#    regularizes the latent space.
-#
-# 3. Total Correlation loss:
-#    encourages latent variables to be independent.
-#
-# The β value controls how strongly TC is penalized.
 
 def beta_tcvae_loss(recon, x, mu, logvar, z, beta_tc):
     recon_loss = F.mse_loss(recon, x, reduction="sum") / x.size(0)
 
+    logvar = torch.clamp(logvar, min=-10.0, max=10.0)
+
     kl_loss = -0.5 * torch.sum(
-        1 + logvar - mu.pow(2) - logvar.exp()
+        1.0 + logvar - mu.pow(2) - logvar.exp()
     ) / x.size(0)
 
     tc_loss = estimate_total_correlation(z, mu, logvar)
@@ -318,23 +202,17 @@ def beta_tcvae_loss(recon, x, mu, logvar, z, beta_tc):
 
 
 ##############
-# 10. Main training function
+# 7. Main
 ##############
-# This function:
-# - loads the crop metadata
-# - keeps only the train split
-# - creates the DataLoader
-# - trains the β-TCVAE
-# - saves the trained model and encoder
 
 def main():
     print("Loading data...")
     df = pd.read_csv(CSV_PATH)
 
-    train_df = df[df["split"] == "OOD_train"].copy()
+    train_df = df[df["split"] == TRAIN_SPLIT].copy()
 
     if train_df.empty:
-        raise ValueError("No training rows found with split == 'OOD_train'.")
+        raise ValueError(f"No training rows found with split == {TRAIN_SPLIT}.")
 
     print("Training samples:", len(train_df))
 
@@ -361,7 +239,7 @@ def main():
 
     history = []
 
-    print("Starting β-TCVAE pretraining...")
+    print("Starting fixed beta TCVAE pretraining...")
 
     for epoch in range(1, NUM_EPOCHS + 1):
         model.train()
@@ -386,7 +264,11 @@ def main():
                 recon, x, mu, logvar, z, BETA_TC
             )
 
+            if torch.isnan(loss):
+                raise RuntimeError("NaN loss detected during beta TCVAE pretraining.")
+
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
 
             total_loss_sum += loss.item()
@@ -426,20 +308,6 @@ def main():
 
         torch.save(model.state_dict(), OUTPUT_DIR / "beta_tcvae_latest.pt")
 
-
-##############
-# 11. Save final outputs
-##############
-# After training, the script saves:
-#
-# - the full β-TCVAE model
-# - the encoder only
-# - training history
-# - experiment summary
-#
-# The encoder is saved separately because it will be reused later
-# as a feature extractor for damage classification.
-
     torch.save(model.state_dict(), OUTPUT_DIR / "beta_tcvae_final.pt")
 
     encoder_state = {
@@ -447,6 +315,7 @@ def main():
         "fc_mu": model.fc_mu.state_dict(),
         "fc_logvar": model.fc_logvar.state_dict(),
         "latent_dim": LATENT_DIM,
+        "use_mu_only_for_classifier": True,
     }
 
     torch.save(encoder_state, OUTPUT_DIR / "beta_tcvae_encoder.pt")
@@ -464,22 +333,17 @@ def main():
         "beta_tc": BETA_TC,
         "train_size": int(len(train_df)),
         "device": str(device),
+        "notes": "Fixed version. Pretrains encoder, saves mu representation for downstream classifier. Logvar is not used as classifier input.",
     }
 
     with open(OUTPUT_DIR / "beta_tcvae_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    print("Saved β-TCVAE model outputs:")
+    print("Saved fixed beta TCVAE model outputs:")
     print(OUTPUT_DIR / "beta_tcvae_final.pt")
     print(OUTPUT_DIR / "beta_tcvae_encoder.pt")
     print(OUTPUT_DIR / "beta_tcvae_training_history.csv")
 
-
-##############
-# 12. Run script
-##############
-# This ensures the script only runs when executed directly,
-# not when imported into another file.
 
 if __name__ == "__main__":
     main()
