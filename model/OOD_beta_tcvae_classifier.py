@@ -34,7 +34,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 SEED = 42
 BATCH_SIZE = 32
-NUM_EPOCHS = 30
+NUM_EPOCHS = 10
 NUM_WORKERS = 2
 
 CLASSIFIER_LR = 1e-4
