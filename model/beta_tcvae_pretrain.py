@@ -27,7 +27,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 SEED = 42
 BATCH_SIZE = 32
-NUM_EPOCHS = 15
+NUM_EPOCHS = 5
 LEARNING_RATE = 1e-4
 NUM_WORKERS = 2
 
