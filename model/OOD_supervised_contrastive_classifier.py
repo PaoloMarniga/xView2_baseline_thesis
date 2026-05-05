@@ -8,7 +8,6 @@ import pandas as pd
 from tqdm.auto import tqdm
 
 from sklearn.metrics import f1_score, classification_report, confusion_matrix
-from sklearn.utils.class_weight import compute_class_weight
 
 import torch
 import torch.nn as nn
@@ -34,7 +33,7 @@ CONTRASTIVE_LR = 1e-4
 CLASSIFIER_LR = 1e-4
 ENCODER_FINETUNE_LR = 1e-5
 
-USE_CLASS_WEIGHTS = True
+LABEL_SMOOTHING = 0.10
 
 TEMPERATURE = 0.10
 PROJECTION_DIM = 128
@@ -121,6 +120,7 @@ class XViewBuildingDataset(Dataset):
         if self.contrastive:
             x1 = self.augment(x)
             x2 = self.augment(x)
+
             return (
                 torch.tensor(x1, dtype=torch.float32),
                 torch.tensor(x2, dtype=torch.float32),
@@ -141,6 +141,7 @@ class ResNet50SixChannelEncoder(nn.Module):
         backbone = resnet50(weights=weights)
 
         old_conv = backbone.conv1
+
         new_conv = nn.Conv2d(
             in_channels=6,
             out_channels=old_conv.out_channels,
@@ -166,6 +167,7 @@ class ResNet50SixChannelEncoder(nn.Module):
 class ProjectionHead(nn.Module):
     def __init__(self, input_dim=2048, projection_dim=128):
         super().__init__()
+
         self.projector = nn.Sequential(
             nn.Linear(input_dim, input_dim),
             nn.ReLU(),
@@ -205,8 +207,8 @@ class SupConLoss(nn.Module):
 
     def forward(self, features, labels):
         device = features.device
-        labels = labels.contiguous().view(-1, 1)
 
+        labels = labels.contiguous().view(-1, 1)
         mask = torch.eq(labels, labels.T).float().to(device)
 
         similarity = torch.matmul(features, features.T) / self.temperature
@@ -394,6 +396,7 @@ def main():
     print(f"\nUsing device: {device}")
 
     encoder = ResNet50SixChannelEncoder().to(device)
+
     projection_head = ProjectionHead(
         input_dim=FEATURE_DIM,
         projection_dim=PROJECTION_DIM,
@@ -415,6 +418,7 @@ def main():
 
         encoder.train()
         projection_head.train()
+
         total_loss = 0.0
 
         progress_bar = tqdm(
@@ -502,22 +506,12 @@ def main():
         classifier_head=classifier_head,
     ).to(device)
 
-    if USE_CLASS_WEIGHTS:
-        weights = compute_class_weight(
-            class_weight="balanced",
-            classes=np.array([0, 1, 2, 3]),
-            y=train_df["damage_label"].map(LABEL_TO_IDX).values,
-        )
+    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
 
-        weights = torch.tensor(weights, dtype=torch.float32).to(device)
-
-        criterion = nn.CrossEntropyLoss(weight=weights)
-
-        print("\nUsing class weights:")
-        print(weights.cpu().numpy())
-
-    else:
-        criterion = nn.CrossEntropyLoss()
+    print(
+        "\nUsing cross entropy loss without class weights "
+        f"and with label_smoothing={LABEL_SMOOTHING}"
+    )
 
     classifier_optimizer = torch.optim.Adam(
         [
@@ -708,7 +702,8 @@ def main():
         "projection_dim": PROJECTION_DIM,
         "feature_dim": FEATURE_DIM,
         "num_workers": NUM_WORKERS,
-        "use_class_weights": USE_CLASS_WEIGHTS,
+        "use_class_weights": False,
+        "label_smoothing": LABEL_SMOOTHING,
         "device": str(device),
         "best_ood_test_macro_f1": float(best_f1),
         "final_ood_test_macro_f1": float(final_test["macro_f1"]),
@@ -719,7 +714,7 @@ def main():
         "train_locations": sorted(list(train_locations)),
         "test_locations": sorted(list(test_locations)),
         "hold_locations": sorted(list(hold_locations)),
-        "method": "ResNet50 six-channel encoder with supervised contrastive representation pretraining followed by supervised classifier training.",
+        "method": "ResNet50 six-channel encoder with supervised contrastive representation pretraining followed by classifier training without class weights.",
     }
 
     with open(OUTPUT_DIR / "summary.json", "w", encoding="utf-8") as f:
@@ -732,6 +727,9 @@ def main():
         json.dump(hold_report, f, indent=2)
 
     print("\nSaved all ResNet50 supervised contrastive outputs successfully.")
+    print(OUTPUT_DIR / "best_model.pt")
+    print(OUTPUT_DIR / "classifier_history.csv")
+    print(OUTPUT_DIR / "summary.json")
 
 
 if __name__ == "__main__":
